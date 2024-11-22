@@ -3,6 +3,7 @@ package service
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,41 +31,87 @@ func NewCommandService(commandRepo repository.CommandRepository, defaultShellPat
 }
 
 func (s *commandService) CreateCommand(ctx context.Context, commandText string) (entity.Command, error) {
-	// запрос к репо
-	return entity.Command{}, nil
+	command, err := s.commandRepo.CreateCommand(ctx, commandText)
+	if err != nil {
+		s.log.Errorf("commandService.CreateCommand -> commandRepo.CreateCommand: %v", err)
+		return entity.Command{}, err
+	}
+
+	return command, nil
 }
 
 func (s *commandService) DeleteCommandById(ctx context.Context, commandId uint64) error {
-	// запрос к репо
+	err := s.commandRepo.DeleteCommandById(ctx, commandId)
+	if err != nil {
+		s.log.Errorf("commandService.DeleteCommandById -> commandRepo.DeleteCommandById: %v", err)
+		return err
+	}
+
 	return nil
 }
 
 func (s *commandService) ListCommands(ctx context.Context, limit, offset uint64) ([]entity.Command, error) {
-	// запрос к репо
-	return nil, nil
+	commands, err := s.commandRepo.ListCommands(ctx, limit, offset)
+	if err != nil {
+		s.log.Errorf("commandService.ListCommands -> commandRepo.ListCommands: %v", err)
+		return nil, err
+	}
+
+	return commands, nil
 }
 
 func (s *commandService) GetCommandById(ctx context.Context, commandId uint64) (entity.Command, error) {
-	// запрос к репо
-	return entity.Command{}, nil
+	command, err := s.commandRepo.GetCommandById(ctx, commandId)
+	// либо команда не найдена, либо ошибка на уровне подключения к БД
+	if errors.Is(err, repository.ErrCommandNotFound) {
+		return entity.Command{}, ErrCommandNotFound
+	} else if err != nil {
+		s.log.Errorf("commandService.GetCommandById -> commandRepo.GetCommandById: %v", err)
+		return entity.Command{}, err
+	}
+
+	return command, nil
 }
 
 func (s *commandService) processOutput(ctx context.Context, commandId uint64, line string) error {
-	// запрос к репо
+	// добавляем перенос строки в конце потому что bufio.Scanner читает по строкам
+	err := s.commandRepo.SaveCommandOutput(ctx, commandId, line+"\n")
+	if err != nil {
+		s.log.Errorf("commandService.processOutput -> commandRepo.SaveCommandOutput: %v", err)
+		return err
+	}
+
 	return nil
 }
 
 func (s *commandService) RunCommand(ctx context.Context, commandId uint64) error {
-	var command entity.Command
 	// запущена ли уже команда?
-	// запрос к репо
-	// ... проверка - если да, возвращаем ErrCommandAlreadyRunning
+	_, err := s.commandRepo.GetCommandPID(ctx, commandId)
+	// команда уже запущена
+	if err == nil {
+		return ErrCommandAlreadyRunning
+	}
+	// не можем проверить, запущена ли команда, так как возникла ошибка
+	if !errors.Is(err, repository.ErrCommandNotRunning) {
+		s.log.Errorf("commandService.RunCommand -> commandRepo.GetCommandPID: %v", err)
+		return err
+	}
 
-	// получаем команду
-	// запрос к репо
+	command, err := s.commandRepo.GetCommandById(ctx, commandId)
+	// либо команда не найдена, либо ошибка на уровне подключения к БД
+	if errors.Is(err, repository.ErrCommandNotFound) {
+		return ErrCommandNotFound
+	} else if err != nil {
+		s.log.Errorf("commandService.RunCommand -> commandRepo.GetCommandById: %v", err)
+		return err
+	}
 
 	// отчищаем старый вывод команды
-	// запрос к репо
+	err = s.commandRepo.ClearCommandOutput(ctx, commandId)
+	if err != nil {
+		s.log.Errorf("commandService.RunCommand -> commandRepo.ClearCommandOutput: %v", err)
+		return err
+	}
 
 	cmd := exec.Command(s.defaultShellPath, "-c", command.Text)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -89,11 +136,10 @@ func (s *commandService) RunCommand(ctx context.Context, commandId uint64) error
 	}
 
 	// сохраняем  pid команды
-	// запрос к репо
-
+	s.commandRepo.SetCommandPID(ctx, commandId, cmd.Process.Pid)
 	// при завершении команды или возникновении ошибки "забываем" её pid
 	defer func() {
-		// запрос к репо на удаление команды из кэша
+		_ = s.commandRepo.DeleteCommandPID(ctx, commandId)
 	}()
 
 	// сканируем и сохраняем вывод команды
@@ -113,18 +159,28 @@ func (s *commandService) RunCommand(ctx context.Context, commandId uint64) error
 
 func (s *commandService) StopCommand(ctx context.Context, commandId uint64) error {
 	// проверяем наличие команды
-	// запрос к репо
+	_, err := s.commandRepo.GetCommandById(ctx, commandId)
+	// либо команда не найдена, либо ошибка на уровне подключения к БД
+	if errors.Is(err, repository.ErrCommandNotFound) {
+		return ErrCommandNotFound
+	} else if err != nil {
+		s.log.Errorf("commandService.StopCommand -> commandRepo.GetCommandById: %v", err)
+		return err
+	}
 
 	// получаем pid команды
-	// запрос к репо
+	pid, err := s.commandRepo.GetCommandPID(ctx, commandId)
+	if errors.Is(err, repository.ErrCommandNotRunning) {
+		return ErrCommandNotRunning
+	} else if err != nil {
+		s.log.Errorf("commandService.StopCommand -> commandRepo.GetCommandPID: %v", err)
+		return err
+	}
 
 	// после завершения должны удалить pid команды
 	defer func() {
-		// запрос к репо на удаление команды из кэша
+		_ = s.commandRepo.DeleteCommandPID(ctx, commandId)
 	}()
-
-	var pid int
-	var err error
 
 	// нет ошибки на unix системах
 	process, _ := os.FindProcess(pid)
